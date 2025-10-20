@@ -138,11 +138,12 @@ class AgentExecutionEngine:
 
         sampling_params = self.sampling_params.copy()
         sampling_params.update(kwargs)
-
+        logger.error("yes now get_model_resopnse")
         if self.engine_name == "openai":
             output = await self.rollout_engine.get_model_response(prompt, application_id=application_id, **sampling_params)
             return output.text
         elif self.engine_name == "verl":
+            logger.error("yes now in verl")
             meta_data = sampling_params.pop("meta_info", {})
             validate = meta_data.get("validate", False)
             output = await self.rollout_engine.get_model_response(prompt, application_id=application_id, validate=validate, **sampling_params)
@@ -214,19 +215,30 @@ class AgentExecutionEngine:
             prompt_messages = agent.chat_completions.copy()
             # Max remaining tokens left for the response
             # For enforced max prompt at each step, no need to deduct here
+            images_to_pass = None
             if not self.enforce_max_prompt_length:
                 max_tokens = self.max_response_length - response_token_len
             else:
                 max_tokens = self.max_response_length
 
                 # since max prompt is enforced, we filter out too long prompts.
-                prompt_str = self.chat_parser.parse(prompt_messages, add_generation_prompt=True, is_first_msg=True)
+                # [--- MODIFICATION START ---]
+                # 檢查 prompt 長度時，處理 parse 可能返回的元組
+                parsed_result = self.chat_parser.parse(prompt_messages, add_generation_prompt=True, is_first_msg=True)
+
+                if isinstance(parsed_result, tuple):
+                    prompt_str, images_to_pass = parsed_result
+                else:
+                    prompt_str = parsed_result
+                # prompt_str = self.chat_parser.parse(prompt_messages, add_generation_prompt=True, is_first_msg=True)
                 prompt_len = len(self.tokenizer.encode(prompt_str, add_special_tokens=False))
                 if prompt_len > self.max_prompt_length:
                     termination_reason = "PROMPT_TRUNCATION"
                     break
 
             kwargs["max_tokens"] = max_tokens
+            if images_to_pass:
+                kwargs["images"] = images_to_pass
 
             start_time = time.time()
             response = await self.get_model_response(prompt_messages, application_id, **kwargs)
@@ -234,8 +246,15 @@ class AgentExecutionEngine:
             llm_time += delta_time
             total_time += delta_time
             # Update steps
+            # <--- 第二個修改點 ---
+            # 建立日誌記錄時，處理 parse 的動態返回值
+            parsed_prompt_for_log = self.chat_parser.parse(prompt_messages, add_generation_prompt=True, is_first_msg=True)
+            if isinstance(parsed_prompt_for_log, tuple):
+                prompt_log_str, _ = parsed_prompt_for_log
+            else:
+                prompt_log_str = parsed_prompt_for_log
             prompt_response_pair = {
-                "prompt": self.chat_parser.parse(prompt_messages, add_generation_prompt=True, is_first_msg=True),
+                "prompt": prompt_log_str,
                 "response": response,
             }
             episode_steps.append(prompt_response_pair)
@@ -376,26 +395,21 @@ class AgentExecutionEngine:
         if mode == "Text":
             return trajectory
         elif mode == "Token":
-            token_result = {
-                "prompt_tokens": torch.tensor(prompt_tokens, dtype=torch.long),
-                "response_tokens": torch.tensor(response_tokens, dtype=torch.long),
-                "response_masks": torch.tensor(response_masks, dtype=torch.long),
-                "trajectory_reward": trajectory.reward,
-                "idx": env.idx,
-                "chat_completions": agent.chat_completions,
-                "metrics": {
-                    # Total number of steps taken in the trajectory
-                    "steps": len(trajectory.steps),
-                    # Time to calculate reward
-                    "reward_time": reward_time,
-                    # Total time spent in environment execution (env.step)
-                    "env_time": env_time,
-                    # Time to calculate response tokens
-                    "llm_time": llm_time,
-                    # Total time spent in the trajectory
-                    "total_time": total_time,
-                },
+            engine_metrics = {
+                # Total number of steps taken in the trajectory
+                "steps": len(trajectory.steps),
+                # Time to calculate reward
+                "reward_time": reward_time,
+                # Total time spent in environment execution (env.step)
+                "env_time": env_time,
+                # Time to calculate response tokens
+                "llm_time": llm_time,
+                # Total time spent in the trajectory
+                "total_time": total_time,
             }
+            if hasattr(agent, "metrics") and isinstance(agent.metrics, dict):
+                engine_metrics.update(agent.metrics)
+            token_result = {"prompt_tokens": torch.tensor(prompt_tokens, dtype=torch.long), "response_tokens": torch.tensor(response_tokens, dtype=torch.long), "response_masks": torch.tensor(response_masks, dtype=torch.long), "trajectory_reward": trajectory.reward, "idx": env.idx, "chat_completions": agent.chat_completions, "metrics": engine_metrics}
             return token_result
         elif mode == "Conversation":
             return agent.chat_completions
@@ -427,7 +441,9 @@ class AgentExecutionEngine:
         self.executor = ThreadPoolExecutor(max_workers=max_concurrency)
 
         if self.engine_name == "verl":
+            logger.error("now wake up")
             self.rollout_engine.wake_up()
+            logger.error("now wake up end")
 
         async def launch_one_trajectory_task(env_idx: int):
             try:

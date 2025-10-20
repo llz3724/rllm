@@ -54,7 +54,16 @@ def convert_messages_to_tokens_and_masks(messages: list[dict[str, str]], tokeniz
     all_msg_masks = []
 
     def _convert_message_to_tokens_and_masks(msg, first_msg=False, generation_msg=False):
-        msg_text = parser.parse([msg], add_generation_prompt=generation_msg, is_first_msg=first_msg)
+        # [--- 修正開始 ---]
+        # 1. 調用 parser 並接收可能為元組的結果
+        parsed_result = parser.parse([msg], add_generation_prompt=generation_msg, is_first_msg=first_msg)
+
+        # 2. 判斷結果類型，確保 msg_text 始終為字符串
+        if isinstance(parsed_result, tuple):
+            msg_text, _ = parsed_result  # 我們只需要字符串，忽略圖片列表
+        else:
+            msg_text = parsed_result
+        # [--- 修正結束 ---]
 
         # Remove the assistant token since it is contained in previous message as generation prompt
         if msg["role"] == "assistant":

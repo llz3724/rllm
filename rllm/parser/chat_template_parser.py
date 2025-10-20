@@ -6,6 +6,7 @@ import torch
 
 from .utils import PARSER_TEST_MESSAGES
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -193,6 +194,7 @@ class QwenChatTemplateParser(ChatTemplateParser):
         self.system_token = "<|im_start|>system\n"
         self.user_token = "<|im_start|>user\n"
         self.assistant_token = "<|im_start|>assistant\n"
+        self.disable_thinking = disable_thinking
         if disable_thinking:
             self.assistant_token += "<think>\\n\\n</think>\\n\\n"
         self.generation_prompt = self.assistant_token
@@ -203,28 +205,86 @@ class QwenChatTemplateParser(ChatTemplateParser):
         self.tool_response_start_token = "<tool_response>\n"
         self.tool_response_end_token = "\n</tool_response>"
 
-    def parse(self, messages, add_generation_prompt=False, is_first_msg=False, **kwargs) -> str:
-        result = ""
+    def parse(self, messages, add_generation_prompt=False, is_first_msg=False, **kwargs):
+        """
+        重写 parse 方法，使其能够智能地处理单条消息和多条消息。
+        - 当只有一条消息时，使用手动拼接，以满足库中其他部分对单条消息处理的期望。
+        - 当有多条消息时，使用 tokenizer.apply_chat_template 来确保多模态和复杂模板的正确性。
+        """
+        # [--- 解决方案核心 ---]
+        # 如果消息列表里只有一条消息，我们就退回到手动拼接的逻辑
+        if len(messages) == 1:
+            message = messages[0]
+            role = message["role"]
+            if role == "system":
+                # 注意：原始的单条处理逻辑可能不包含 BOS/EOS，这里需要保持一致
+                return self.parse_system(message)
+            elif role == "user":
+                # 在这里处理多模态内容
+                content = message.get("content")
+                image_locations = []
+                if isinstance(content, list):
+                    # 提取图片位置，但文本部分需要拼接好
+                    text_parts = []
+                    for item in content:
+                        if item.get("type") == "text":
+                            text_parts.append(item.get("text", ""))
+                        elif item.get("type") == "image_url":
+                            image_url_data = item.get("image_url", {})
+                            if "url" in image_url_data:
+                                image_locations.append(image_url_data["url"])
+                                # Qwen VLM 的模板通常在这里放一个占位符，
+                                # 但 apply_chat_template 会自动处理。
+                                # 手动模式下，我们通常只是拼接文本。
+                                # 假设图片信息由其他逻辑处理，这里只返回文本部分。
+                    # 将文本部分组合起来
+                    message["content"] = "\n".join(text_parts)
 
-        # if the first message is not a system message, add the system message
-        if is_first_msg and messages[0]["role"] != "system":
-            result += self.system_token + "You are Qwen, created by Alibaba Cloud. You are a helpful assistant." + self.eot_token
-
-        for message in messages:
-            if message["role"] == "system":
-                result += self.parse_system(message)
-            elif message["role"] == "user":
-                result += self.parse_user(message)
-            elif message["role"] == "assistant":
-                result += self.parse_assistant(message)
-            elif message["role"] == "tool":
-                result += self.parse_tool(message)
+                parsed_str = self.parse_user(message)
+                if image_locations:
+                    return parsed_str, image_locations
+                else:
+                    return parsed_str
+            elif role == "assistant":
+                parsed_str = self.parse_assistant(message)
+                if add_generation_prompt:
+                    # 对于单条 assistant 消息，如果需要 generation prompt，
+                    # 它的行为可能与 apply_chat_template 不同。
+                    # 根据 rllm 的逻辑，generation_prompt 是在外部添加的，
+                    # 或者是在 assistant_token 里面。
+                    # 这里的 parse_assistant 已经包含了 assistant_token，所以通常不需要额外做什么。
+                    pass
+                return parsed_str
+            elif role == "tool":
+                return self.parse_tool(message)
             else:
                 raise NotImplementedError(f"Unsupported message role: {message['role']}")
 
-        if add_generation_prompt:
-            result += self.generation_prompt
-        return result
+        # [--- 保留你原有的多模态和多消息逻辑 ---]
+        # 当有多条消息时，使用 apply_chat_template
+        all_image_locations = []
+        for message in messages:
+            if message["role"] == "user" and isinstance(message.get("content"), list):
+                for item in message["content"]:
+                    if item.get("type") == "image_url":
+                        image_url_data = item.get("image_url", {})
+                        if "url" in image_url_data:
+                            all_image_locations.append(image_url_data["url"])
+
+        # 使用官方模板的标准流程
+        result_str = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=add_generation_prompt)
+
+        # 特殊处理 disable_thinking 的情况
+        if self.disable_thinking and add_generation_prompt and self.generation_prompt not in result_str:
+            # 如果官方模板没加我们想要的 thinking 标签，手动补上
+            # 注意：更稳妥的方式是确保 result_str 以 assistant token 结尾，然后追加
+            if result_str.endswith(self.assistant_token.split("<think>")[0]):
+                result_str += "<think>\\n\\n</think>\\n\\n"
+
+        if all_image_locations:
+            return result_str, all_image_locations
+        else:
+            return result_str
 
     def parse_system(self, message):
         return self.system_token + message["content"] + self.eot_token
